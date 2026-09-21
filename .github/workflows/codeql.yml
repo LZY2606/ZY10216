@@ -30,7 +30,7 @@ jobs:
         languages: "python"
 
     - name: "Run CodeQL autobuild"
-      uses: "github/codeql-action/autobuild@4e94bd11f71e507f7f87df81788dff88d1dacbfb"
+      uses: "github/codeql-action/autobuild@1c5b675653bb5c22dbe9b12b556ec555138e09fd"
 
     - name: "Run CodeQL analyze"
       uses: "github/codeql-action/analyze@4e94bd11f71e507f7f87df81788dff88d1dacbfb"
