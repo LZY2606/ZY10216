@@ -28,6 +28,7 @@ A few notes on the implementation.
 from jmespath import lexer
 from jmespath.compat import with_repr_method
 from jmespath import ast
+from jmespath import budget
 from jmespath import exceptions
 from jmespath import visitor
 
@@ -513,8 +514,8 @@ class ParsedResult(object):
 
     def search(self, value, options=None):
         interpreter = visitor.TreeInterpreter(options)
-        result = interpreter.visit(self.parsed, value)
-        return result
+        return budget.run_interpreter(
+            interpreter, self.parsed, value, self.expression, options)
 
     def _render_dot_file(self):
         """Render the parsed AST as a dot file.

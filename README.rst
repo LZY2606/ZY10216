@@ -180,6 +180,114 @@ JMESPath libraries, not just python), please let us know at
 `jmespath.site <https://github.com/jmespath/jmespath.site/issues>`__.
 
 
+Resource Budgets and Cancellation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Deep projections, flatten operations, ``sort_by`` and custom functions can
+perform substantially more work than the surface size of an expression
+suggests.  Evaluations are therefore optionally bounded by a resource
+budget and can be cooperatively cancelled.  Budgets and cancellation are
+opt-in through ``jmespath.Options``; with default options evaluation is
+unlimited and results are unchanged.
+
+Per-category limits are passed as ``budget_limits`` (a mapping keyed by the
+constants on ``jmespath.BudgetCategory``) together with an optional
+``total_budget``:
+
+.. code:: python
+
+    >>> import jmespath
+    >>> from jmespath import BudgetCategory
+    >>> options = jmespath.Options(budget_limits={
+    ...     BudgetCategory.AST_VISIT: 1000,
+    ...     BudgetCategory.ARRAY_ITERATION: 10_000,
+    ... })
+
+The five independently tracked categories are:
+
+``ast_visit``
+    One unit every time the interpreter dispatches an AST node.  A
+    short-circuited ``||`` right operand, for example, is never visited and
+    never charged.
+
+``array_iteration``
+    One unit every time a single element of an array (or a single value of
+    an object projection such as ``a.*``) is examined.  This covers
+    projections, filters, slices and flatten traversal as well as the
+    internal scans of built-in functions such as ``map``, ``avg``,
+    ``sum``, ``join``, ``reverse``, ``sort``, ``sort_by``, ``min_by`` and
+    ``max_by``.  Signature validation of typed arrays (for example the
+    ``array-number`` argument of ``avg``) is also counted here.
+
+``comparison``
+    One unit per executed value comparison: comparator nodes (``==``,
+    ``!=``, ``<``, ``<=``, ``>``, ``>=``) and the key comparisons done by
+    ``sort``/``sort_by``/``min``/``max``/``min_by``/``max_by``.  Ordering
+    operators whose operands are not both comparable evaluate to ``null``
+    without performing (or charging) a comparison.
+
+``function_call``
+    One unit per JMESPath function invocation, charged after arguments are
+    resolved and before arity/type validation, so calls that fail
+    validation still consume the unit.
+
+``generated_element``
+    One unit per element placed into an intermediate collection created
+    during evaluation: projected lists, flatten/slice results,
+    multi-select lists and hashes, ``map`` and ``sort`` output, ``keys``,
+    ``values`` and ``merge`` entries, and ``to_array`` wrappers.
+
+**Endpoint semantics.** Limits are inclusive: consuming exactly the
+configured limit is allowed and the evaluation finishes normally, while the
+next unit of work raises ``jmespath.BudgetExceededError``.  The exception
+exposes ``category``, ``attempted``, ``category_limit``, ``attempted_total``,
+``total_limit`` and a numeric ``consumed`` mapping, plus ``expression``,
+``ast_path`` and ``data_path`` diagnostic strings.  User data is never
+serialized into the exception.  After an evaluation completes, a
+``budget_observer`` callable on the options receives a
+``jmespath.BudgetSnapshot`` with the final counters.
+
+Cancellation uses a thread safe token; the token is consulted before every
+chargeable unit of work (also when limits are not configured) and raises
+``jmespath.exceptions.JMESPathCancelledError``, which is distinct from
+``BudgetExceededError``, arity errors and type errors:
+
+.. code:: python
+
+    >>> token = jmespath.CancellationToken()
+    >>> options = jmespath.Options(cancellation_token=token)
+    >>> token.cancel()  # e.g. from another thread
+
+Per-call state lives in :mod:`contextvars`, never on the shared, cached AST:
+the same compiled expression can run concurrently under different budgets.
+A custom function that recursively calls :func:`jmespath.search` is always
+billed to the parent evaluation's budget; budget options supplied to the
+nested call cannot reset the parent allowance.  Custom functions can bill
+their own work through the restricted context returned by
+:func:`jmespath.function_context`:
+
+.. code:: python
+
+    >>> class Functions(jmespath.functions.Functions):
+    ...     @jmespath.functions.signature({'types': ['array']})
+    ...     def _func_do_work(self, arg):
+    ...         ctx = jmespath.function_context()
+    ...         ctx.charge(jmespath.BudgetCategory.ARRAY_ITERATION, len(arg))
+    ...         return len(arg)
+
+The context exposes ``charge``, ``consumed``, ``remaining``, ``cancelled``,
+``data_path``, ``ast_path`` and a ``search`` helper, but provides no way to
+reset counters or raise limits.
+
+Complexity notes: budgets make the evaluator reject inputs whose work would
+otherwise grow beyond the configured bounds, but they do not change the
+asymptotic complexity of successful evaluations.  Comparison counts for
+``sort``/``sort_by`` follow the host Python sorting implementation; the
+test suite relies only on deterministic counts for small, fixed inputs
+(``n - 1`` comparisons on runs shorter than the sort's minimum run size)
+rather than wall-clock timeouts.
+
+
 Specification
 =============
 

@@ -120,3 +120,75 @@ class EmptyExpressionError(JMESPathError):
 
 class UnknownFunctionError(JMESPathError):
     pass
+
+
+@with_str_method
+class BudgetExceededError(JMESPathError):
+    """Raised when a configured budget limit would be exceeded.
+
+    The endpoint semantics are inclusive: consuming exactly the configured
+    limit is allowed and the evaluation finishes normally; the next unit of
+    work raises this error.
+    """
+
+    def __init__(self, category, attempted, category_limit, attempted_total,
+                 total_limit, consumed, locations=None):
+        self.category = category
+        self.attempted = attempted
+        self.category_limit = category_limit
+        self.attempted_total = attempted_total
+        self.total_limit = total_limit
+        #: Per-category consumption counters at the time of failure.  These
+        #: are numbers only; user data is never included.
+        self.consumed = consumed
+        self.locations = locations or {}
+        self.expression = self.locations.get('expression')
+        self.ast_path = self.locations.get('ast_path')
+        self.data_path = self.locations.get('data_path')
+
+    def __str__(self):
+        if (self.category_limit is not None and
+                self.attempted > self.category_limit):
+            limit_text = ('category limit of %d for %r' %
+                          (self.category_limit, self.category))
+        else:
+            limit_text = ('total limit of %d' % self.total_limit)
+        lines = [
+            'Budget exceeded while evaluating JMESPath expression:',
+            '  rejected charge: %s (%d would have been consumed)' % (
+                self.category, self.attempted),
+            '  limit: %s' % limit_text,
+            '  total consumed: %d' % self.attempted_total,
+        ]
+        for name in (
+                'ast_visit', 'array_iteration', 'comparison',
+                'function_call', 'generated_element'):
+            lines.append('  consumed[%s] = %d' % (name, self.consumed[name]))
+        if self.expression:
+            lines.append('  expression: "%s"' % self.expression)
+        if self.ast_path:
+            lines.append('  ast path: %s' % self.ast_path)
+        if self.data_path:
+            lines.append('  data path: %s' % self.data_path)
+        return '\n'.join(lines)
+
+
+@with_str_method
+class JMESPathCancelledError(JMESPathError):
+    """Raised when the active cancellation token has been set."""
+
+    def __init__(self, locations=None):
+        self.locations = locations or {}
+        self.expression = self.locations.get('expression')
+        self.ast_path = self.locations.get('ast_path')
+        self.data_path = self.locations.get('data_path')
+
+    def __str__(self):
+        lines = ['JMESPath evaluation was cancelled.']
+        if self.expression:
+            lines.append('  expression: "%s"' % self.expression)
+        if self.ast_path:
+            lines.append('  ast path: %s' % self.ast_path)
+        if self.data_path:
+            lines.append('  data path: %s' % self.data_path)
+        return '\n'.join(lines)

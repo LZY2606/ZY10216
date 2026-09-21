@@ -1,9 +1,85 @@
 import math
 import json
 
+from jmespath import budget as budget_module
 from jmespath import exceptions
 from jmespath.compat import string_type as STRING_TYPE
 from jmespath.compat import get_methods
+from numbers import Number
+
+
+
+def _is_actual_number(x):
+    if isinstance(x, bool):
+        return False
+    return isinstance(x, Number)
+
+
+def _equals(x, y):
+    # Mirrors the 0/1 vs True/False special casing used by the interpreter.
+    if _is_actual_number(x) and x in (0, 1) and isinstance(y, bool):
+        return False
+    if _is_actual_number(y) and y in (0, 1) and isinstance(x, bool):
+        return False
+    return x == y
+
+class _MeteredOrderable(object):
+    """Wraps an element plus its sort key and bills comparisons.
+
+    ``raw`` is the original element (returned by ``sort_by``); ``value``
+    holds the comparison key.  For plain ``sort``/``min``/``max`` the raw
+    element and key are the same.
+    """
+
+    __slots__ = ('raw', 'value', '_budget')
+
+    def __init__(self, value, budget, raw=None):
+        self.raw = value if raw is None else raw
+        self.value = value
+        self._budget = budget
+
+    def __lt__(self, other):
+        self._budget.charge(budget_module.BudgetCategory.COMPARISON)
+        return self.value < other.value
+
+    def __gt__(self, other):
+        self._budget.charge(budget_module.BudgetCategory.COMPARISON)
+        return self.value > other.value
+
+    def __eq__(self, other):
+        return self.value == other.value
+
+    def __ne__(self, other):
+        return self.value != other.value
+
+    def __hash__(self):
+        return hash(self.value)
+
+
+def _metered_best_min(items):
+    # Mirrors the stdlib min()/max() comparison counts exactly: one
+    # comparison per non-leading element.
+    items = iter(items)
+    try:
+        best = next(items)
+    except StopIteration:
+        raise ValueError('arg is an empty sequence')
+    for item in items:
+        if item < best:
+            best = item
+    return best
+
+
+def _metered_best_max(items):
+    items = iter(items)
+    try:
+        best = next(items)
+    except StopIteration:
+        raise ValueError('arg is an empty sequence')
+    for item in items:
+        if item > best:
+            best = item
+    return best
 
 
 # python types -> jmespath types
@@ -68,6 +144,15 @@ class Functions(metaclass=FunctionRegistry):
 
     FUNCTION_TABLE = {
     }
+
+    @property
+    def _active_budget(self):
+        return budget_module.current_budget()
+
+    def _charge(self, category, amount=1):
+        budget = budget_module.current_budget()
+        if budget is not None:
+            budget.charge(category, amount)
 
     def call_function(self, function_name, resolved_args):
         try:
@@ -139,6 +224,7 @@ class Functions(metaclass=FunctionRegistry):
             # we need to validate.
             allowed_subtypes = allowed_subtypes[0]
             for element in current:
+                self._charge(budget_module.BudgetCategory.ARRAY_ITERATION)
                 actual_typename = type(element).__name__
                 if actual_typename not in allowed_subtypes:
                     raise exceptions.JMESPathTypeError(
@@ -156,6 +242,7 @@ class Functions(metaclass=FunctionRegistry):
                 raise exceptions.JMESPathTypeError(
                     function_name, current[0], first, types)
             for element in current:
+                self._charge(budget_module.BudgetCategory.ARRAY_ITERATION)
                 actual_typename = type(element).__name__
                 if actual_typename not in allowed:
                     raise exceptions.JMESPathTypeError(
@@ -168,6 +255,8 @@ class Functions(metaclass=FunctionRegistry):
     @signature({'types': ['array-number']})
     def _func_avg(self, arg):
         if arg:
+            self._charge(budget_module.BudgetCategory.ARRAY_ITERATION,
+                         len(arg))
             return sum(arg) / len(arg)
         else:
             return None
@@ -183,6 +272,7 @@ class Functions(metaclass=FunctionRegistry):
         if isinstance(arg, list):
             return arg
         else:
+            self._charge(budget_module.BudgetCategory.GENERATED_ELEMENT)
             return [arg]
 
     @signature({'types': []})
@@ -212,6 +302,19 @@ class Functions(metaclass=FunctionRegistry):
 
     @signature({'types': ['array', 'string']}, {'types': []})
     def _func_contains(self, subject, search):
+        budget = self._active_budget
+        if isinstance(subject, list):
+            # Membership tests on arrays compare against every element
+            # until a match is found.
+            for element in subject:
+                if budget is not None:
+                    budget.charge(
+                        budget_module.BudgetCategory.ARRAY_ITERATION)
+                    budget.charge(
+                        budget_module.BudgetCategory.COMPARISON)
+                if _equals(element, search):
+                    return True
+            return False
         return search in subject
 
     @signature({'types': ['string', 'array', 'object']})
@@ -231,6 +334,10 @@ class Functions(metaclass=FunctionRegistry):
         if isinstance(arg, STRING_TYPE):
             return arg[::-1]
         else:
+            self._charge(budget_module.BudgetCategory.ARRAY_ITERATION,
+                         len(arg))
+            self._charge(budget_module.BudgetCategory.GENERATED_ELEMENT,
+                         len(arg))
             return list(reversed(arg))
 
     @signature({"types": ['number']})
@@ -249,13 +356,21 @@ class Functions(metaclass=FunctionRegistry):
     def _func_map(self, expref, arg):
         result = []
         for element in arg:
+            self._charge(budget_module.BudgetCategory.ARRAY_ITERATION)
             result.append(expref.visit(expref.expression, element))
+            self._charge(budget_module.BudgetCategory.GENERATED_ELEMENT)
         return result
 
     @signature({"types": ['array-number', 'array-string']})
     def _func_max(self, arg):
+        budget = self._active_budget
         if arg:
-            return max(arg)
+            if budget is None:
+                return max(arg)
+            metered = [_MeteredOrderable(value, budget) for value in arg]
+            self._charge(budget_module.BudgetCategory.ARRAY_ITERATION,
+                         len(arg))
+            return _metered_best_max(metered).value
         else:
             return None
 
@@ -263,32 +378,58 @@ class Functions(metaclass=FunctionRegistry):
     def _func_merge(self, *arguments):
         merged = {}
         for arg in arguments:
+            self._charge(budget_module.BudgetCategory.GENERATED_ELEMENT,
+                         len(arg))
             merged.update(arg)
         return merged
 
     @signature({"types": ['array-number', 'array-string']})
+    @signature({'types': ['array-number', 'array-string']})
     def _func_min(self, arg):
+        budget = self._active_budget
         if arg:
-            return min(arg)
+            if budget is None:
+                return min(arg)
+            metered = [_MeteredOrderable(value, budget) for value in arg]
+            self._charge(budget_module.BudgetCategory.ARRAY_ITERATION,
+                         len(arg))
+            return _metered_best_min(metered).value
         else:
             return None
 
+
     @signature({"types": ['array-string', 'array-number']})
+    @signature({'types': ['array-string', 'array-number']})
     def _func_sort(self, arg):
-        return list(sorted(arg))
+        budget = self._active_budget
+        if budget is None:
+            return list(sorted(arg))
+        metered = [_MeteredOrderable(value, budget) for value in arg]
+        self._charge(budget_module.BudgetCategory.ARRAY_ITERATION, len(arg))
+        ordered = list(sorted(metered))
+        self._charge(budget_module.BudgetCategory.GENERATED_ELEMENT,
+                     len(ordered))
+        return [item.value for item in ordered]
 
     @signature({"types": ['array-number']})
+    @signature({'types': ['array-number']})
     def _func_sum(self, arg):
+        self._charge(budget_module.BudgetCategory.ARRAY_ITERATION, len(arg))
         return sum(arg)
+
 
     @signature({"types": ['object']})
     def _func_keys(self, arg):
         # To be consistent with .values()
         # should we also return the indices of a list?
+        self._charge(budget_module.BudgetCategory.GENERATED_ELEMENT,
+                     len(arg))
         return list(arg.keys())
 
     @signature({"types": ['object']})
     def _func_values(self, arg):
+        self._charge(budget_module.BudgetCategory.GENERATED_ELEMENT,
+                     len(arg))
         return list(arg.values())
 
     @signature({'types': []})
@@ -310,12 +451,15 @@ class Functions(metaclass=FunctionRegistry):
     def _func_sort_by(self, array, expref):
         if not array:
             return array
-        # sort_by allows for the expref to be either a number of
-        # a string, so we have some special logic to handle this.
+        budget = self._active_budget
+        # sort_by allows for the expref to be either a number or a
+        # string, so we have some special logic to handle this.
         # We evaluate the first array element and verify that it's
         # either a string of a number.  We then create a key function
         # that validates that type, which requires that remaining array
         # elements resolve to the same type as the first element.
+        if budget is not None:
+            budget.charge(budget_module.BudgetCategory.ARRAY_ITERATION)
         required_type = self._convert_to_jmespath_type(
             type(expref.visit(expref.expression, array[0])).__name__)
         if required_type not in ['number', 'string']:
@@ -324,27 +468,57 @@ class Functions(metaclass=FunctionRegistry):
         keyfunc = self._create_key_func(expref,
                                         [required_type],
                                         'sort_by')
-        return list(sorted(array, key=keyfunc))
+        if budget is None:
+            return list(sorted(array, key=keyfunc))
+        # The probe above re-evaluates the first element, then every
+        # element (including the first one) is evaluated again for the
+        # actual sort: n+1 array iterations in total.
+        budget.charge(budget_module.BudgetCategory.ARRAY_ITERATION,
+                      len(array))
+        keyed = [_MeteredOrderable(keyfunc(element), budget, raw=element)
+                 for element in array]
+        budget.charge(budget_module.BudgetCategory.GENERATED_ELEMENT,
+                      len(array))
+        ordered = list(sorted(keyed))
+        return [item.raw for item in ordered]
 
     @signature({'types': ['array']}, {'types': ['expref']})
     def _func_min_by(self, array, expref):
         keyfunc = self._create_key_func(expref,
                                         ['number', 'string'],
                                         'min_by')
-        if array:
-            return min(array, key=keyfunc)
-        else:
+        if not array:
             return None
+        budget = self._active_budget
+        if budget is None:
+            return min(array, key=keyfunc)
+        return self._budgeted_min_max_by(
+            array, keyfunc, budget, pick_max=False)
 
     @signature({'types': ['array']}, {'types': ['expref']})
     def _func_max_by(self, array, expref):
         keyfunc = self._create_key_func(expref,
                                         ['number', 'string'],
                                         'max_by')
-        if array:
-            return max(array, key=keyfunc)
-        else:
+        if not array:
             return None
+        budget = self._active_budget
+        if budget is None:
+            return max(array, key=keyfunc)
+        return self._budgeted_min_max_by(
+            array, keyfunc, budget, pick_max=True)
+
+    def _budgeted_min_max_by(self, array, keyfunc, budget, pick_max):
+        # Every element key is evaluated once (n array iterations) and a
+        # non-empty result performs n-1 key comparisons.  An empty array
+        # is handled by the callers and consumes no work here.
+        budget.charge(budget_module.BudgetCategory.ARRAY_ITERATION,
+                      len(array))
+        keyed = [_MeteredOrderable(keyfunc(element), budget, raw=element)
+                 for element in array]
+        if pick_max:
+            return _metered_best_max(keyed).raw
+        return _metered_best_min(keyed).raw
 
     def _create_key_func(self, expref, allowed_types, function_name):
         def keyfunc(x):

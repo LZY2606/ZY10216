@@ -1,7 +1,22 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add opt-in resource budgets to ``Options`` (``budget_limits`` and
+  ``total_budget``) that separately cap AST node visits, array element
+  iterations, comparisons, function calls and generated intermediate
+  collection elements.  Exceeding a limit raises
+  ``jmespath.BudgetExceededError`` with expression/AST/data path and
+  counter diagnostics, without serializing user data.  Consuming exactly
+  a limit is allowed; the next unit of work fails.
+* Add cooperative cancellation via ``jmespath.CancellationToken`` and the
+  distinct ``jmespath.JMESPathCancelledError`` exception.
+* Budget state is scoped to a single ``search`` call using
+  ``contextvars``, so cached ASTs remain safe to share concurrently;
+  nested ``search`` calls from custom functions inherit the parent
+  budget.  Custom functions can bill work and observe cancellation via
+  ``jmespath.function_context()``.
+* Default evaluation results and default (unlimited) behavior are
+  unchanged.
 
 
 1.1.0
