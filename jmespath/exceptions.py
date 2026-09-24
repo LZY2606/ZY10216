@@ -120,3 +120,63 @@ class EmptyExpressionError(JMESPathError):
 
 class UnknownFunctionError(JMESPathError):
     pass
+
+
+def _format_diagnostics(diagnostics):
+    if not diagnostics:
+        return ''
+    parts = []
+    if diagnostics.get('expression') is not None:
+        parts.append('expression: "%s"' % diagnostics['expression'])
+    if diagnostics.get('ast_path'):
+        parts.append('AST path: %s' % diagnostics['ast_path'])
+    if diagnostics.get('data_path'):
+        parts.append('data path: %s' % diagnostics['data_path'])
+    consumed = diagnostics.get('consumed')
+    if consumed:
+        rendered = ', '.join(
+            '%s=%s' % (k, consumed[k]) for k in sorted(consumed))
+        parts.append('consumed so far: %s (total=%s)' % (
+            rendered, diagnostics.get('total_consumed')))
+    return '; '.join(parts)
+
+
+@with_str_method
+class BudgetExceededError(JMESPathError):
+    """Raised when an evaluation exceeds its configured budget.
+
+    Diagnostics include the expression, an AST path, a best-effort
+    data path, and per-category consumption.  User data values are
+    never serialized into this error.
+    """
+    def __init__(self, category, consumed, limit, diagnostics=None):
+        super(BudgetExceededError, self).__init__(category, consumed, limit)
+        self.category = category
+        self.consumed = consumed
+        self.limit = limit
+        self.diagnostics = diagnostics or {}
+
+    def __str__(self):
+        return (
+            'JMESPath evaluation budget exceeded: category "%s" '
+            'consumed %s, limit is %s. %s' % (
+                self.category, self.consumed, self.limit,
+                _format_diagnostics(self.diagnostics)))
+
+
+@with_str_method
+class EvaluationCancelledError(JMESPathError):
+    """Raised when an evaluation is cancelled.
+
+    This is intentionally a distinct type from ``BudgetExceededError``,
+    ``JMESPathTypeError`` and ``ArityError`` so callers can tell
+    cancellation apart from evaluation and type failures.
+    """
+    def __init__(self, reason=None, diagnostics=None):
+        super(EvaluationCancelledError, self).__init__(reason)
+        self.reason = reason
+        self.diagnostics = diagnostics or {}
+
+    def __str__(self):
+        return 'JMESPath evaluation cancelled: %s. %s' % (
+            self.reason, _format_diagnostics(self.diagnostics))

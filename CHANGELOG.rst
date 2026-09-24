@@ -1,7 +1,17 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add opt-in evaluation budgets and cancellation
+  (``jmespath.Options(budget=...)``, ``jmespath.budget.BudgetLimits``).
+  Budgets track AST node evaluations, array element iterations,
+  comparisons, function calls, and intermediate collection elements,
+  with a total limit and per-category limits.  Exceeding a limit raises
+  ``jmespath.exceptions.BudgetExceededError`` with expression/AST/data
+  path diagnostics; cancellation raises the distinct
+  ``jmespath.exceptions.EvaluationCancelledError``.  Budget state is
+  per ``search()`` call, so cached ASTs remain safe to share across
+  threads.  Custom functions can debit work and run nested searches
+  under the parent budget via ``jmespath.current_context()``.
 
 
 1.1.0

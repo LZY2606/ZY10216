@@ -1,5 +1,6 @@
 import operator
 
+from jmespath import budget as budget_module
 from jmespath import functions
 from jmespath.compat import string_type
 from numbers import Number
@@ -58,7 +59,7 @@ def _is_actual_number(x):
 
 class Options(object):
     """Options to control how a JMESPath function is evaluated."""
-    def __init__(self, dict_cls=None, custom_functions=None):
+    def __init__(self, dict_cls=None, custom_functions=None, budget=None):
         #: The class to use when creating a dict.  The interpreter
         #  may create dictionaries during the evaluation of a JMESPath
         #  expression.  For example, a multi-select hash will
@@ -69,6 +70,15 @@ class Options(object):
         #  have predictable key ordering.
         self.dict_cls = dict_cls
         self.custom_functions = custom_functions
+        #: Optional evaluation budget.  Accepts a
+        #: ``jmespath.budget.BudgetLimits`` instance or a dict of
+        #: limits, e.g. ``{'total': 10000, 'elements': 1000}``.
+        #: When provided, every search call made with these options
+        #: gets its own fresh budget state; exceeding a limit raises
+        #: ``jmespath.exceptions.BudgetExceededError``.
+        if budget is not None:
+            budget = budget_module.BudgetLimits.from_value(budget)
+        self.budget = budget
 
 
 class _Expression(object):
@@ -115,12 +125,46 @@ class TreeInterpreter(Visitor):
         if options is None:
             options = Options()
         self._options = options
+        #: The EvaluationContext for this evaluation, or None when no
+        #: budget is configured.  A TreeInterpreter is created per
+        #: search call, so budget state never leaks across calls even
+        #: when the parsed AST is shared through the parser cache.
+        self.context = None
+        if self._options.budget is not None:
+            self.context = budget_module.EvaluationContext(
+                self._options.budget, self._options)
         if options.dict_cls is not None:
             self._dict_cls = self._options.dict_cls
         if options.custom_functions is not None:
             self._functions = self._options.custom_functions
         else:
             self._functions = functions.Functions()
+
+    def visit(self, node, *args, **kwargs):
+        context = self.context
+        if context is None:
+            return super(TreeInterpreter, self).visit(node, *args, **kwargs)
+        context.consume(budget_module.CATEGORY_AST_NODES)
+        context.ast_path.append(node['type'])
+        try:
+            return super(TreeInterpreter, self).visit(node, *args, **kwargs)
+        finally:
+            context.ast_path.pop()
+
+    def _consume(self, category, amount=1):
+        context = self.context
+        if context is not None:
+            context.consume(category, amount)
+
+    def _push_data_path(self, segment):
+        context = self.context
+        if context is not None:
+            context.data_path.append(segment)
+
+    def _pop_data_path(self):
+        context = self.context
+        if context is not None:
+            context.data_path.pop()
 
     def default_visit(self, node, *args, **kwargs):
         raise NotImplementedError(node['type'])
@@ -139,6 +183,7 @@ class TreeInterpreter(Visitor):
 
     def visit_comparator(self, node, value):
         # Common case: comparator is == or !=
+        self._consume(budget_module.CATEGORY_COMPARISONS)
         comparator_func = self.COMPARATOR_FUNC[node['value']]
         if node['value'] in self._EQUALITY_OPS:
             return comparator_func(
@@ -164,6 +209,7 @@ class TreeInterpreter(Visitor):
         return _Expression(node['children'][0], self)
 
     def visit_function_expression(self, node, value):
+        self._consume(budget_module.CATEGORY_FUNCTION_CALLS)
         resolved_args = []
         for child in node['children']:
             current = self.visit(child, value)
@@ -176,11 +222,19 @@ class TreeInterpreter(Visitor):
             return None
         comparator_node = node['children'][2]
         collected = []
-        for element in base:
-            if self._is_true(self.visit(comparator_node, element)):
-                current = self.visit(node['children'][1], element)
-                if current is not None:
-                    collected.append(current)
+        for i, element in enumerate(base):
+            self._push_data_path('[%s]' % i)
+            try:
+                self._consume(budget_module.CATEGORY_ELEMENTS)
+                if self._is_true(self.visit(comparator_node, element)):
+                    current = self.visit(node['children'][1], element)
+                else:
+                    continue
+            finally:
+                self._pop_data_path()
+            if current is not None:
+                self._consume(budget_module.CATEGORY_OUTPUT_ELEMENTS)
+                collected.append(current)
         return collected
 
     def visit_flatten(self, node, value):
@@ -190,9 +244,13 @@ class TreeInterpreter(Visitor):
             return None
         merged_list = []
         for element in base:
+            self._consume(budget_module.CATEGORY_ELEMENTS)
             if isinstance(element, list):
+                self._consume(budget_module.CATEGORY_OUTPUT_ELEMENTS,
+                              len(element))
                 merged_list.extend(element)
             else:
+                self._consume(budget_module.CATEGORY_OUTPUT_ELEMENTS)
                 merged_list.append(element)
         return merged_list
 
@@ -219,7 +277,9 @@ class TreeInterpreter(Visitor):
         if not isinstance(value, list):
             return None
         s = slice(*node['children'])
-        return value[s]
+        result = value[s]
+        self._consume(budget_module.CATEGORY_OUTPUT_ELEMENTS, len(result))
+        return result
 
     def visit_key_val_pair(self, node, value):
         return self.visit(node['children'][0], value)
@@ -233,6 +293,7 @@ class TreeInterpreter(Visitor):
         collected = self._dict_cls()
         for child in node['children']:
             collected[child['value']] = self.visit(child, value)
+            self._consume(budget_module.CATEGORY_OUTPUT_ELEMENTS)
         return collected
 
     def visit_multi_select_list(self, node, value):
@@ -241,6 +302,7 @@ class TreeInterpreter(Visitor):
         collected = []
         for child in node['children']:
             collected.append(self.visit(child, value))
+            self._consume(budget_module.CATEGORY_OUTPUT_ELEMENTS)
         return collected
 
     def visit_or_expression(self, node, value):
@@ -274,9 +336,15 @@ class TreeInterpreter(Visitor):
         if not isinstance(base, list):
             return None
         collected = []
-        for element in base:
-            current = self.visit(node['children'][1], element)
+        for i, element in enumerate(base):
+            self._push_data_path('[%s]' % i)
+            try:
+                self._consume(budget_module.CATEGORY_ELEMENTS)
+                current = self.visit(node['children'][1], element)
+            finally:
+                self._pop_data_path()
             if current is not None:
+                self._consume(budget_module.CATEGORY_OUTPUT_ELEMENTS)
                 collected.append(current)
         return collected
 
@@ -287,9 +355,15 @@ class TreeInterpreter(Visitor):
         except AttributeError:
             return None
         collected = []
-        for element in base:
-            current = self.visit(node['children'][1], element)
+        for i, element in enumerate(base):
+            self._push_data_path('[%s]' % i)
+            try:
+                self._consume(budget_module.CATEGORY_ELEMENTS)
+                current = self.visit(node['children'][1], element)
+            finally:
+                self._pop_data_path()
             if current is not None:
+                self._consume(budget_module.CATEGORY_OUTPUT_ELEMENTS)
                 collected.append(current)
         return collected
 

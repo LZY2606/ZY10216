@@ -28,6 +28,7 @@ A few notes on the implementation.
 from jmespath import lexer
 from jmespath.compat import with_repr_method
 from jmespath import ast
+from jmespath import budget
 from jmespath import exceptions
 from jmespath import visitor
 
@@ -513,8 +514,20 @@ class ParsedResult(object):
 
     def search(self, value, options=None):
         interpreter = visitor.TreeInterpreter(options)
-        result = interpreter.visit(self.parsed, value)
-        return result
+        context = interpreter.context
+        if context is None:
+            # Clear any stale context from a previous budgeted
+            # evaluation on this thread.
+            budget._ACTIVE_CONTEXT.set(None)
+            return interpreter.visit(self.parsed, value)
+        context.expression = self.expression
+        # Publish the per-call context so functions (built-in and
+        # custom) can debit work against it.  The context is left as
+        # the "current" one after evaluation so callers can inspect
+        # final consumption via budget.current_context(); the next
+        # search call on this thread replaces it.
+        budget._ACTIVE_CONTEXT.set(context)
+        return interpreter.visit(self.parsed, value)
 
     def _render_dot_file(self):
         """Render the parsed AST as a dot file.

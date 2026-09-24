@@ -180,6 +180,88 @@ JMESPath libraries, not just python), please let us know at
 `jmespath.site <https://github.com/jmespath/jmespath.site/issues>`__.
 
 
+Evaluation Budgets and Cancellation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Evaluating an expression can require far more work than the size of
+the expression suggests: deep projections, ``flatten``, ``sort_by``,
+or a custom function can iterate arbitrarily large data.  You can
+attach an evaluation budget through ``jmespath.Options`` to bound
+that work:
+
+.. code:: python
+
+    >>> import jmespath
+    >>> options = jmespath.Options(
+    ...     budget={'total': 100000, 'elements': 1000})
+    >>> jmespath.search('items[*].v', {'items': [{'v': 1}]}, options)
+    [1]
+
+The budget may be a dict (as above) or a
+``jmespath.budget.BudgetLimits`` instance.  A ``total`` limit caps the
+sum of all consumption; the remaining keys cap individual categories:
+
+* ``ast_nodes`` - every evaluation of an AST node.  Nodes evaluated
+  repeatedly (e.g. the right hand side of a projection, once per
+  element) count once per evaluation.
+* ``elements`` - every iteration over a data array element
+  (projections, filter projections, flatten, ``map()``).
+* ``comparisons`` - every comparison expression (``==``, ``>``, ...)
+  and every key evaluation in ``sort_by()``/``min_by()``/``max_by()``.
+* ``function_calls`` - every JMESPath function invocation.
+* ``output_elements`` - every element appended to an intermediate
+  collection (projection/flatten results, multi-select lists and
+  dicts, slices, ``map()``, ``sort()``, ``sort_by()``, ``reverse()``,
+  ``keys()``, ``values()``).
+
+The endpoint semantics are fixed: consumption may reach a limit
+exactly and still succeed; only strictly exceeding a limit raises
+``jmespath.exceptions.BudgetExceededError``.  The error carries
+diagnostics (expression, AST path, best-effort data path, per-category
+consumption and the exceeded limit) but never serializes user data
+values.
+
+Budget state belongs to a single ``search()`` call.  Parsed
+expressions shared through the parser cache (``jmespath.compile``)
+can safely be evaluated concurrently with different budgets.
+
+Custom functions participate through the restricted evaluation
+context, available as ``jmespath.current_context()`` (``None`` when
+no budgeted evaluation is running):
+
+.. code:: python
+
+    from jmespath import current_context, functions
+
+    class MyFunctions(functions.Functions):
+        @functions.signature({'types': ['array']})
+        def _func_scan(self, array):
+            context = current_context()
+            for element in array:
+                if context is not None:
+                    context.consume('elements')  # debit own work
+            return len(array)
+
+        @functions.signature({'types': []})
+        def _func_nested(self, value):
+            # Nested evaluation shares the parent budget; it cannot
+            # bypass the parent's limits.
+            return current_context().search('a.b', value)
+
+Cancellation is separate from budget exhaustion.  Call
+``context.cancel(reason)`` from a custom function, or pass a
+``should_cancel`` callable in the budget, to abort evaluation with
+``jmespath.exceptions.EvaluationCancelledError`` — a distinct type
+from ``BudgetExceededError``, ``JMESPathTypeError`` and
+``ArityError``.
+
+Compatibility notes: budgets are opt-in.  When no budget is
+configured, evaluation results and performance characteristics are
+unchanged.  Enabling a budget adds one counter increment per counted
+operation, so evaluation remains linear in the work it already
+performs; no wall-clock timers or background threads are involved.
+
+
 Specification
 =============
 

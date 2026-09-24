@@ -1,9 +1,19 @@
 import math
 import json
 
+from jmespath import budget as budget_module
 from jmespath import exceptions
 from jmespath.compat import string_type as STRING_TYPE
 from jmespath.compat import get_methods
+
+
+def _consume(category, amount=1):
+    # Debit work against the active evaluation's budget, if any.
+    # Functions run inside an evaluation started by search(), so the
+    # context (when configured) is available through the budget module.
+    context = budget_module.current_context()
+    if context is not None:
+        context.consume(category, amount)
 
 
 # python types -> jmespath types
@@ -231,7 +241,9 @@ class Functions(metaclass=FunctionRegistry):
         if isinstance(arg, STRING_TYPE):
             return arg[::-1]
         else:
-            return list(reversed(arg))
+            result = list(reversed(arg))
+            _consume(budget_module.CATEGORY_OUTPUT_ELEMENTS, len(result))
+            return result
 
     @signature({"types": ['number']})
     def _func_ceil(self, arg):
@@ -249,7 +261,9 @@ class Functions(metaclass=FunctionRegistry):
     def _func_map(self, expref, arg):
         result = []
         for element in arg:
+            _consume(budget_module.CATEGORY_ELEMENTS)
             result.append(expref.visit(expref.expression, element))
+            _consume(budget_module.CATEGORY_OUTPUT_ELEMENTS)
         return result
 
     @signature({"types": ['array-number', 'array-string']})
@@ -275,7 +289,9 @@ class Functions(metaclass=FunctionRegistry):
 
     @signature({"types": ['array-string', 'array-number']})
     def _func_sort(self, arg):
-        return list(sorted(arg))
+        result = list(sorted(arg))
+        _consume(budget_module.CATEGORY_OUTPUT_ELEMENTS, len(result))
+        return result
 
     @signature({"types": ['array-number']})
     def _func_sum(self, arg):
@@ -285,11 +301,15 @@ class Functions(metaclass=FunctionRegistry):
     def _func_keys(self, arg):
         # To be consistent with .values()
         # should we also return the indices of a list?
-        return list(arg.keys())
+        result = list(arg.keys())
+        _consume(budget_module.CATEGORY_OUTPUT_ELEMENTS, len(result))
+        return result
 
     @signature({"types": ['object']})
     def _func_values(self, arg):
-        return list(arg.values())
+        result = list(arg.values())
+        _consume(budget_module.CATEGORY_OUTPUT_ELEMENTS, len(result))
+        return result
 
     @signature({'types': []})
     def _func_type(self, arg):
@@ -324,7 +344,9 @@ class Functions(metaclass=FunctionRegistry):
         keyfunc = self._create_key_func(expref,
                                         [required_type],
                                         'sort_by')
-        return list(sorted(array, key=keyfunc))
+        result = list(sorted(array, key=keyfunc))
+        _consume(budget_module.CATEGORY_OUTPUT_ELEMENTS, len(result))
+        return result
 
     @signature({'types': ['array']}, {'types': ['expref']})
     def _func_min_by(self, array, expref):
@@ -348,6 +370,10 @@ class Functions(metaclass=FunctionRegistry):
 
     def _create_key_func(self, expref, allowed_types, function_name):
         def keyfunc(x):
+            # Each key evaluation is counted as a comparison: it is
+            # the per-element work that drives sorting and min/max
+            # selection.
+            _consume(budget_module.CATEGORY_COMPARISONS)
             result = expref.visit(expref.expression, x)
             actual_typename = type(result).__name__
             jmespath_type = self._convert_to_jmespath_type(actual_typename)
